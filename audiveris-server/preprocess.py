@@ -1,24 +1,36 @@
 """
 Advanced image preprocessing for OMR (Optical Music Recognition).
 
-Pipeline for camera photos of sheet music (10 steps):
-  Raw camera photo
-    → Auto-crop             (remove desk/background around page)
-    → Perspective correction (straighten tilted shots)
-    → Dewarp                (flatten curved pages / book spines)
-    → Deskew                (align staff lines horizontally)
-    → Resize                (target 2400px long edge, min 1600 short)
-    → Sharpen               (recover phone-camera blur via unsharp mask)
-    → Smart binarize        (Sauvola first, Adobe-Scan fallback)
-    → Close gaps            (reconnect broken staff lines)
-    → Noise removal         (connected-component filtering)
-    → Clean B&W image ready for Audiveris
+TWO-STAGE STAFF-AWARE PIPELINE (Zemsky-inspired):
 
-Inspired by Leptonica's approach (as used by Zemsky's Sheet Music Scanner):
-  - pixSauvolaBinarize  → our _sauvola()
-  - dewarpBuildPageModel → our _dewarp()
-  - pixDeskew            → our _deskew()
-  - fixPerspective       → our _perspective_correct()
+  Stage A — Quick pre-clean + staff detection
+    Raw camera photo
+      → Auto-crop             (remove desk/background around page)
+      → Perspective correction (straighten tilted shots)
+      → Dewarp                (flatten curved pages / book spines)
+      → Quick Otsu binarize   (just for staff detection)
+      → ★ Staff detection ★   (horizontal RLE projection → 5-line groups)
+
+  Stage B — Staff-guided corrections
+      → Staff-guided deskew   (use actual staff angle, not Hough guessing)
+      → Staff-guided resize   (normalize interline to ideal 20px for Audiveris)
+      → Sharpen               (recover phone-camera blur via unsharp mask)
+      → Smart binarize        (Sauvola first, Adobe-Scan fallback)
+      → Close gaps            (reconnect broken staff lines)
+      → Staff-aware denoise   (aggressive far from staves, gentle near them)
+      → Clean B&W image ready for Audiveris
+
+Key insight: staff lines are the most robust visual feature in any photo
+of sheet music.  By detecting them FIRST, we use their geometry (angle,
+spacing, y-positions) to guide every subsequent correction — making even
+careless phone photos look like clean scans before Audiveris sees them.
+
+Inspired by Zemsky's Sheet Music Scanner (staffaDetect) and Leptonica:
+  - staffaDetect / rleGetRowRuns → our _detect_staffs()
+  - pixSauvolaBinarize           → our _sauvola()
+  - dewarpBuildPageModel         → our _dewarp()
+  - pixDeskew                    → our _staff_guided_deskew()
+  - fixPerspective               → our _perspective_correct()
 
 Uses OpenCV when available (best quality), falls back to PIL + numpy.
 """
@@ -131,16 +143,420 @@ def _resize_only(src: str, dst: str, target: int) -> str:
 
 
 # ──────────────────────────────────────────────────────────
-#  OpenCV pipeline  (perspective + dewarp + deskew + Sauvola + CC cleanup)
+#  Staff detection & staff-guided preprocessing (Zemsky-inspired)
+#
+#  Key insight: staff lines are the most robust visual feature in any
+#  photo of sheet music.  They survive blur, tilt, poor lighting, and
+#  even partial occlusion.  By detecting them FIRST, we can use their
+#  geometry (angle, spacing, y-positions) to guide every subsequent
+#  correction — turning "blind" preprocessing into "staff-aware".
+#
+#  Algorithm overview (adapted from Zemsky's staffaDetect):
+#    1. Horizontal projection profile on binary image
+#    2. Find peaks (dark rows = staff lines)
+#    3. Group peaks into 5-line staves (consistent spacing)
+#    4. Compute line_height, space_height, interline
+#    5. Measure staff angles via horizontal RLE segment endpoints
+# ──────────────────────────────────────────────────────────
+
+from dataclasses import dataclass, field
+from typing import List, Optional
+
+
+@dataclass
+class StaffLine:
+    """A single detected staff line."""
+    y: int            # row position (center of line)
+    thickness: int    # line thickness in pixels
+    angle: float      # angle in degrees (0 = perfectly horizontal)
+
+
+@dataclass
+class Staff:
+    """A 5-line staff group."""
+    lines: List[StaffLine]     # exactly 5 lines, top to bottom
+    top: int                   # y of topmost line
+    bottom: int                # y of bottommost line
+    interline: float           # average distance between adjacent lines
+    line_height: float         # average staff-line thickness
+    space_height: float        # average gap between lines
+    angle: float               # overall staff angle in degrees
+
+
+def _quick_binarize(gray):
+    """Fast Otsu binarization just for staff detection (not final output).
+
+    We don't need Sauvola quality here — we just need a reasonable
+    black/white split to count horizontal projections.
+    """
+    # Slight blur to reduce noise
+    blurred = cv2.GaussianBlur(gray, (5, 5), 0)
+    _, binary = cv2.threshold(blurred, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    return binary
+
+
+def _detect_staffs(binary) -> List[Staff]:
+    """Detect staff systems via column-sliced horizontal projection.
+
+    The problem with global horizontal projection: a tilted staff line
+    spreads its ink across many rows, diluting the per-row signal.
+
+    Solution: divide the image into narrow vertical STRIPS.  In each strip,
+    even a tilted line occupies only a few rows, producing strong peaks.
+    Then trace the peaks across strips to reconstruct full staff lines.
+
+    Algorithm:
+      1. Split image into ~8 vertical strips
+      2. In each strip, compute horizontal projection (sum of black per row)
+      3. Find peak rows in each strip (staff-line intersections)
+      4. Merge peaks across strips to form full staff lines
+      5. Group into 5-line staves via consistent spacing
+      6. Measure angle from the left→right peak drift across strips
+    """
+    h, w = binary.shape[:2]
+
+    # --- Step 1: Column-sliced horizontal projection ---
+    N_STRIPS = 8
+    strip_w = w // N_STRIPS
+    if strip_w < 50:
+        N_STRIPS = max(1, w // 50)
+        strip_w = w // N_STRIPS
+
+    # Collect peak rows from each strip
+    strip_peaks = []  # list of arrays, one per strip
+    for s in range(N_STRIPS):
+        x0 = s * strip_w
+        x1 = x0 + strip_w if s < N_STRIPS - 1 else w
+        strip = binary[:, x0:x1]
+        sw = x1 - x0
+
+        # Horizontal projection in this strip
+        proj = np.sum(strip == 0, axis=1).astype(np.float64)
+
+        # Adaptive threshold: peaks must be significantly above background.
+        # Use the bimodal split: staff rows have much higher projection than
+        # symbol/noise rows.  The median of nonzero projections provides a
+        # natural boundary — staff rows will be well above it.
+        nonzero = proj[proj > 0]
+        if len(nonzero) < 10:
+            strip_peaks.append(np.array([], dtype=int))
+            continue
+
+        # Primary: rows above 50% of max projection in this strip
+        # (staff lines dominate, so max ≈ staff-line projection)
+        max_proj = nonzero.max()
+        threshold = max(max_proj * 0.4, 5)  # at least 5 pixels
+
+        peaks = np.where(proj >= threshold)[0]
+        strip_peaks.append(peaks)
+
+    # --- Step 2: Merge peaks across strips ---
+    # For each strip, merge adjacent peak rows into line segments.
+    # A line segment is (center_y, thickness) in that strip.
+    strip_lines = []  # list of list of (center_y, thickness)
+    for peaks in strip_peaks:
+        if len(peaks) == 0:
+            strip_lines.append([])
+            continue
+        segs = []
+        grp_start = int(peaks[0])
+        prev = int(peaks[0])
+        for r in peaks[1:]:
+            r = int(r)
+            if r - prev > 3:
+                segs.append(((grp_start + prev) // 2, prev - grp_start + 1))
+                grp_start = r
+            prev = r
+        segs.append(((grp_start + prev) // 2, prev - grp_start + 1))
+        strip_lines.append(segs)
+
+    # --- Step 3: Use the best strip as reference, trace lines across strips ---
+    best_strip = max(range(N_STRIPS), key=lambda i: len(strip_lines[i]))
+    ref_segs = strip_lines[best_strip]
+    if len(ref_segs) < 5:
+        log(f"Staff detection: best strip has only {len(ref_segs)} segments")
+        return []
+
+    # For each reference segment, trace LEFT and RIGHT strip-by-strip.
+    # This handles large tilts because we allow incremental drift per strip.
+    lines: List[StaffLine] = []
+    # Max drift between adjacent strips: up to 5° tilt
+    max_drift_per_strip = int(strip_w * np.tan(np.radians(5))) + 5
+
+    for center_y, thickness in ref_segs:
+        trace = {best_strip: center_y}  # strip_index → y_position
+
+        # Trace rightward
+        cur_y = center_y
+        for si in range(best_strip + 1, N_STRIPS):
+            found = False
+            for cy, _ in strip_lines[si]:
+                if abs(cy - cur_y) <= max_drift_per_strip:
+                    trace[si] = cy
+                    cur_y = cy
+                    found = True
+                    break
+            if not found:
+                break
+
+        # Trace leftward
+        cur_y = center_y
+        for si in range(best_strip - 1, -1, -1):
+            found = False
+            for cy, _ in strip_lines[si]:
+                if abs(cy - cur_y) <= max_drift_per_strip:
+                    trace[si] = cy
+                    cur_y = cy
+                    found = True
+                    break
+            if not found:
+                break
+
+        # Require matches in >= 50% of strips
+        if len(trace) >= max(N_STRIPS * 0.5, 3):
+            # Compute angle from leftmost to rightmost match
+            sorted_trace = sorted(trace.items())
+            si_l, cy_l = sorted_trace[0]
+            si_r, cy_r = sorted_trace[-1]
+            angle = 0.0
+            if si_r > si_l:
+                dx = (si_r - si_l) * strip_w
+                dy = cy_r - cy_l
+                angle = np.degrees(np.arctan2(dy, dx))
+
+            lines.append(StaffLine(y=center_y, thickness=max(thickness, 1),
+                                   angle=angle if abs(angle) < 10 else 0.0))
+
+    if len(lines) < 5:
+        log(f"Staff detection: only {len(lines)} validated lines (need ≥5)")
+        return []
+
+    log(f"Staff detection: {len(lines)} candidate lines")
+
+    # Filter unreasonably thick bands
+    med_thick = float(np.median([l.thickness for l in lines]))
+    max_thick = max(med_thick * 3, 20)
+    lines = [l for l in lines if l.thickness <= max_thick]
+    if len(lines) < 5:
+        log(f"Staff detection: {len(lines)} lines after thickness filter")
+        return []
+
+    # --- Step 4: Group into 5-line staves ---
+    gaps = [lines[i + 1].y - lines[i].y for i in range(len(lines) - 1)]
+    if not gaps:
+        return []
+    gap_arr = np.array(gaps, dtype=float)
+    reasonable = gap_arr[(gap_arr > 3) & (gap_arr < h * 0.05)]
+    if len(reasonable) < 4:
+        log("Staff detection: no consistent interline spacing")
+        return []
+    interline_est = float(np.median(reasonable))
+
+    staffs: List[List[StaffLine]] = []
+    current_group = [lines[0]]
+    for i in range(len(lines) - 1):
+        gap = lines[i + 1].y - lines[i].y
+        if abs(gap - interline_est) < interline_est * 0.4:
+            current_group.append(lines[i + 1])
+        else:
+            if len(current_group) >= 5:
+                staffs.append(current_group[:5])
+            current_group = [lines[i + 1]]
+    if len(current_group) >= 5:
+        staffs.append(current_group[:5])
+
+    if not staffs:
+        log("Staff detection: no 5-line groups found")
+        return []
+
+    # --- Step 5: Build Staff objects ---
+    result: List[Staff] = []
+    for group in staffs:
+        ys = [l.y for l in group]
+        interlines = [ys[j + 1] - ys[j] for j in range(4)]
+        avg_il = float(np.mean(interlines))
+        avg_th = float(np.mean([l.thickness for l in group]))
+        avg_angle = float(np.mean([l.angle for l in group]))
+        result.append(Staff(
+            lines=group, top=ys[0], bottom=ys[4],
+            interline=avg_il, line_height=avg_th,
+            space_height=max(avg_il - avg_th, 1), angle=avg_angle
+        ))
+
+    info = ", ".join(
+        f"staff{i+1}[y={s.top}-{s.bottom} il={s.interline:.1f} θ={s.angle:+.2f}°]"
+        for i, s in enumerate(result)
+    )
+    log(f"Staff detection: {len(result)} staves — {info}")
+    return result
+
+
+def _staff_guided_deskew(gray, staffs: List[Staff]):
+    """Deskew using the precise angle measured from staff lines.
+
+    Much more accurate than the generic HoughLinesP approach because
+    we're measuring the actual staff lines, not random edges.
+    """
+    # Use the median angle across all staves
+    angles = [s.angle for s in staffs if abs(s.angle) > 0.01]
+    if not angles:
+        log("Staff-guided deskew: staves already horizontal")
+        return gray
+
+    angle = float(np.median(angles))
+    if abs(angle) < 0.1:
+        log(f"Staff-guided deskew: angle {angle:+.2f}° too small, skipping")
+        return gray
+
+    h, w = gray.shape[:2]
+    M = cv2.getRotationMatrix2D((w // 2, h // 2), angle, 1.0)
+    cos_a, sin_a = abs(M[0, 0]), abs(M[0, 1])
+    nW = int(h * sin_a + w * cos_a)
+    nH = int(h * cos_a + w * sin_a)
+    M[0, 2] += (nW - w) / 2
+    M[1, 2] += (nH - h) / 2
+    rotated = cv2.warpAffine(gray, M, (nW, nH),
+                             borderMode=cv2.BORDER_CONSTANT, borderValue=255)
+    log(f"Staff-guided deskew: rotated {angle:+.2f}°")
+    return rotated
+
+
+def _staff_guided_resize(gray, staffs: List[Staff], target: int):
+    """Scale the image so interline spacing matches Audiveris's ideal range.
+
+    Audiveris's interline detector works best when interline ≥ 16px.
+    The ideal range is 18-25px.  We know the ACTUAL interline from staff
+    detection, so we can scale precisely instead of guessing from image size.
+
+    This is a huge advantage over blind resizing: a phone photo at 3000px
+    might have tiny staves (interline=8) or large ones (interline=30).
+    Blind resize can't tell the difference. We can.
+    """
+    # Average interline across all detected staves
+    avg_interline = float(np.mean([s.interline for s in staffs]))
+    h, w = gray.shape[:2]
+
+    # Target interline: 20px is Audiveris's sweet spot
+    IDEAL_INTERLINE = 20.0
+    MIN_INTERLINE = 16.0
+
+    if avg_interline < 1:
+        log("Staff-guided resize: invalid interline, falling back to blind resize")
+        return _resize(gray, target)
+
+    if avg_interline >= MIN_INTERLINE and avg_interline <= IDEAL_INTERLINE * 1.5:
+        # Already in good range — check if image size also OK
+        if min(w, h) >= 1600 and max(w, h) <= MAX_LONG_EDGE:
+            log(f"Staff-guided resize: interline={avg_interline:.1f}px already ideal, no resize needed")
+            return gray
+
+    # Scale to hit ideal interline
+    scale = IDEAL_INTERLINE / avg_interline
+
+    # Safety clamps: don't blow up or shrink too much
+    new_long = max(w, h) * scale
+    new_short = min(w, h) * scale
+
+    if new_long > MAX_LONG_EDGE:
+        scale = MAX_LONG_EDGE / max(w, h)
+    if new_short < 1200:
+        scale = max(scale, 1200.0 / min(w, h))
+
+    if abs(scale - 1.0) < 0.05:
+        log(f"Staff-guided resize: scale={scale:.3f} ~1.0, skipping")
+        return gray
+
+    interp = cv2.INTER_CUBIC if scale > 1 else cv2.INTER_AREA
+    resized = cv2.resize(gray, None, fx=scale, fy=scale, interpolation=interp)
+    new_interline = avg_interline * scale
+    log(f"Staff-guided resize: interline {avg_interline:.1f}→{new_interline:.1f}px "
+        f"(scale={scale:.2f}, {w}×{h}→{resized.shape[1]}×{resized.shape[0]})")
+    return resized
+
+
+def _staff_aware_noise_removal(binary, staffs: List[Staff], min_area=10):
+    """Staff-aware noise removal: keep components near staves, aggressively remove distant ones.
+
+    Zemsky insight: real music symbols are always near a staff.
+    Components far from any staff are almost certainly noise (dust, texture,
+    compression artifacts, background speckles).
+
+    Strategy:
+      - Near a staff (within 2× staff height): standard noise filter (min_area)
+      - Far from all staves: aggressive noise filter (much larger min_area)
+    """
+    h, w = binary.shape[:2]
+
+    # Build a distance map: for each row, how far is it from the nearest staff?
+    # Staff zone = from staff.top - margin to staff.bottom + margin
+    if not staffs:
+        return _remove_noise(binary, min_area)
+
+    # Compute margin as 2× average staff height (generous zone for symbols)
+    avg_staff_height = float(np.mean([s.bottom - s.top for s in staffs]))
+    margin = int(avg_staff_height * 2)
+
+    # Create mask of "near staff" rows
+    near_staff = np.zeros(h, dtype=bool)
+    for s in staffs:
+        y_start = max(0, s.top - margin)
+        y_end = min(h, s.bottom + margin)
+        near_staff[y_start:y_end] = True
+
+    # Process connected components
+    inv = cv2.bitwise_not(binary)
+    n, labels, stats, centroids = cv2.connectedComponentsWithStats(inv, connectivity=8)
+    clean = np.full_like(binary, 255)
+
+    removed_noise = 0
+    removed_distant = 0
+
+    for i in range(1, n):
+        area = stats[i, cv2.CC_STAT_AREA]
+        c_y = int(centroids[i][1])
+        cw = stats[i, cv2.CC_STAT_WIDTH]
+        ch = stats[i, cv2.CC_STAT_HEIGHT]
+
+        is_near = 0 <= c_y < h and near_staff[c_y]
+
+        if is_near:
+            # Standard filter: keep if big enough and not a single pixel
+            if area >= min_area and (cw > 2 or ch > 2):
+                clean[labels == i] = 0
+            else:
+                removed_noise += 1
+        else:
+            # Aggressive filter for distant components:
+            # Must be much larger to survive (likely a page number, title, etc.)
+            min_distant_area = max(min_area * 10, 100)
+            if area >= min_distant_area and cw > 3 and ch > 3:
+                clean[labels == i] = 0
+            else:
+                removed_distant += 1
+
+    if removed_noise or removed_distant:
+        log(f"Staff-aware noise: removed {removed_noise} near-staff specks, "
+            f"{removed_distant} distant specks")
+    return clean
+
+
+# ──────────────────────────────────────────────────────────
+#  OpenCV pipeline  (staff-aware two-stage architecture)
 # ──────────────────────────────────────────────────────────
 
 def _cv2_pipeline(src: str, dst: str, target: int) -> str:
     """Camera-photo → clean B&W pipeline optimised for music notation.
 
-    Inspired by Leptonica's approach (as used by Zemsky's Sheet Music Scanner):
-    - Sauvola binarization (gold standard for thin lines + uneven lighting)
-    - Sharpening to recover phone-camera blur
-    - Conservative morphology to preserve delicate music symbols
+    TWO-STAGE ARCHITECTURE (Zemsky-inspired):
+      Stage A — Quick pre-clean + staff detection
+        Get staff lines as early as possible so we can use their geometry
+        (angle, spacing, position) to guide every subsequent correction.
+      Stage B — Staff-guided corrections + final binarization
+        Deskew, perspective, scale, noise all use staff geometry.
+
+    The key insight: staff lines are the most robust feature in any photo.
+    Even blurry, tilted, poorly-lit shots still show horizontal lines.
+    By detecting them first, we use them as a "skeleton" to fix everything.
     """
     img = cv2.imread(src)
     if img is None:
@@ -150,36 +566,64 @@ def _cv2_pipeline(src: str, dst: str, target: int) -> str:
     h, w = img.shape[:2]
     log(f"Input {w}×{h}  mode={'color' if len(img.shape)==3 else 'gray'}")
 
-    # 1. Auto-crop — remove non-page border (table, desk, background)
+    # ── Stage A: Quick pre-clean + staff detection ─────────────
+
+    # A1. Auto-crop — remove non-page border (table, desk, background)
     img = _auto_crop(img)
 
-    # 2. Perspective correction (straighten tilted shots)
+    # A2. Perspective correction (straighten tilted shots)
     img = _perspective_correct(img)
 
-    # 3. Grayscale
+    # A3. Grayscale
     gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY) if len(img.shape) == 3 else img
 
-    # 4. Dewarp — straighten curved/bent pages (book spines, curled paper)
+    # A4. Dewarp — straighten curved/bent pages
     gray = _dewarp(gray)
 
-    # 5. Deskew via staff-line angle
-    gray = _deskew(gray)
+    # A5. Quick binarize just for staff detection (not the final output)
+    quick_bin = _quick_binarize(gray)
 
-    # 6. Resize to target range (Audiveris needs interline ≥ 16px)
-    gray = _resize(gray, target)
+    # A6. ★ STAFF DETECTION — the key Zemsky insight ★
+    #     Detect staff lines via horizontal RLE projection.
+    #     Returns staff geometry: line positions, angles, spacing.
+    staffs = _detect_staffs(quick_bin)
 
-    # 7. Sharpen — phone photos are always slightly soft; unsharp mask
-    #    recovers thin staff lines that would otherwise vanish in binarization
+    # ── Stage B: Staff-guided corrections ──────────────────────
+
+    # B1. Staff-guided deskew (use actual staff angles, not Hough guessing)
+    if staffs:
+        gray = _staff_guided_deskew(gray, staffs)
+        # Re-detect staffs after rotation (positions shifted)
+        quick_bin = _quick_binarize(gray)
+        staffs = _detect_staffs(quick_bin)
+    else:
+        gray = _deskew(gray)
+
+    # B2. Staff-guided resize — normalize so interline = ideal pixels
+    if staffs:
+        gray = _staff_guided_resize(gray, staffs, target)
+    else:
+        gray = _resize(gray, target)
+
+    # B3. Sharpen — phone photos are always slightly soft
     gray = _sharpen(gray)
 
-    # 8. Binarize — Sauvola first (like Zemsky/Leptonica), Adobe-Scan fallback
+    # B4. Final Sauvola binarization (the real one, on the corrected image)
     binary = _smart_binarize(gray)
 
-    # 9. Morphological close to reconnect broken staff lines
+    # B5. Morphological close to reconnect broken staff lines
     binary = _close_gaps(binary)
 
-    # 10. Remove small noise specks
-    binary = _remove_noise(binary)
+    # B6. Staff-aware noise removal
+    if staffs:
+        # Re-detect on final binary (positions changed after resize)
+        staffs_final = _detect_staffs(binary)
+        if staffs_final:
+            binary = _staff_aware_noise_removal(binary, staffs_final)
+        else:
+            binary = _remove_noise(binary)
+    else:
+        binary = _remove_noise(binary)
 
     cv2.imwrite(dst, binary)
     fh, fw = binary.shape[:2]
