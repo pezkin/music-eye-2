@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useRef, useCallback, useMemo } from 'react';
+import React, { useState, useEffect, useRef, useCallback } from 'react';
 import {
   View,
   Text,
@@ -6,12 +6,10 @@ import {
   Image,
   ScrollView,
   Pressable,
-  Animated,
 } from 'react-native';
 
 const ACCENT = '#E05A2A';
 const ACCENT_LIGHT = 'rgba(224, 90, 42, 0.18)';
-const ACCENT_GLOW = 'rgba(224, 90, 42, 0.35)';
 const BAR_HEIGHT = 6;
 
 /**
@@ -41,22 +39,7 @@ export const PlaybackVisualization = ({
   const [imageNaturalHeight, setImageNaturalHeight] = useState(0);
   const prevSystemRef = useRef(-1);
 
-  // Pulse animation for note highlights
-  const pulseAnim = useRef(new Animated.Value(1)).current;
-  useEffect(() => {
-    if (!isPlaying) {
-      pulseAnim.setValue(1);
-      return;
-    }
-    const loop = Animated.loop(
-      Animated.sequence([
-        Animated.timing(pulseAnim, { toValue: 0.55, duration: 400, useNativeDriver: true }),
-        Animated.timing(pulseAnim, { toValue: 1, duration: 400, useNativeDriver: true }),
-      ])
-    );
-    loop.start();
-    return () => loop.stop();
-  }, [isPlaying]);
+
 
   // Load natural image dimensions
   useEffect(() => {
@@ -130,15 +113,6 @@ export const PlaybackVisualization = ({
     cursorTop = (system.top - pad) * zoomScale;
     cursorHeight = (system.bottom - system.top + pad * 2) * zoomScale;
   }
-
-  // ─── Highlighted notes ───
-  const highlightedNotes = useMemo(() => {
-    if (!activeEntry || positions.length === 0) return [];
-    const activeTime = activeEntry.time;
-    return positions.filter((p) => Math.abs(p.time - activeTime) < 0.001);
-  }, [activeIndex, positions]);
-
-  const dotSize = Math.max(14, Math.min(28, renderHeight * 0.015));
 
   // ─── Progress ratio ───
   const progressRatio =
@@ -277,37 +251,6 @@ export const PlaybackVisualization = ({
                 resizeMode="contain"
               />
 
-              {/* Note highlights */}
-              {showCursor &&
-                highlightedNotes.map((note, idx) => {
-                  const nImgX = xRange.min + note.ratio * rangeSpan;
-                  const nX = nImgX * zoomScale;
-                  const noteSys = systemBounds[note.systemIndex];
-                  // Use real per-note Y when available, fall back to system center
-                  const nY = (typeof note.y === 'number' && Number.isFinite(note.y))
-                    ? note.y * zoomScale
-                    : noteSys
-                      ? ((noteSys.top + noteSys.bottom) / 2) * zoomScale
-                      : cursorTop + cursorHeight / 2;
-
-                  return (
-                    <Animated.View
-                      key={`hl-${idx}`}
-                      style={[
-                        styles.noteHighlight,
-                        {
-                          left: nX - dotSize / 2,
-                          top: nY - dotSize / 2,
-                          width: dotSize,
-                          height: dotSize,
-                          borderRadius: dotSize / 2,
-                          opacity: pulseAnim,
-                        },
-                      ]}
-                    />
-                  );
-                })}
-
               {/* Vertical cursor bar */}
               {showCursor && (
                 <View
@@ -422,13 +365,6 @@ const styles = StyleSheet.create({
     left: 0,
     backgroundColor: ACCENT_LIGHT,
     zIndex: 5,
-  },
-  noteHighlight: {
-    position: 'absolute',
-    backgroundColor: ACCENT_GLOW,
-    borderWidth: 2,
-    borderColor: ACCENT,
-    zIndex: 11,
   },
   noImage: {
     height: 200,

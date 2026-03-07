@@ -270,7 +270,7 @@ export class AudioPlaybackService {
       const si = group[0].staffIndex;
 
       timingMap.push({
-        time, x: avgX, y: avgY, staffIndex: si, isRest: false,
+        time, x: avgX, y: avgY, staffIndex: si, systemIndex: group[0].systemIndex ?? 0, isRest: false,
       });
 
       const noteEntries = group.map(n => ({
@@ -291,7 +291,7 @@ export class AudioPlaybackService {
       // Only add if no note event exists at this time
       if (!beatMap.has(Math.round(r.beatOffset * 1000) / 1000)) {
         timingMap.push({
-          time, x: r.x || 0, y: r.y || 0, staffIndex: r.staffIndex, isRest: true,
+          time, x: r.x || 0, y: r.y || 0, staffIndex: r.staffIndex, systemIndex: r.systemIndex ?? 0, isRest: true,
         });
       }
     }
@@ -393,7 +393,7 @@ export class AudioPlaybackService {
       const time = bo * secondsPerBeat;
       const avgX = group.reduce((s, n) => s + (n.x || 0), 0) / group.length;
       const avgY = group.reduce((s, n) => s + (n.y || 0), 0) / group.length;
-      timingMap.push({ time, x: avgX, y: avgY, staffIndex: group[0].staffIndex, isRest: false });
+      timingMap.push({ time, x: avgX, y: avgY, staffIndex: group[0].staffIndex, systemIndex: group[0].systemIndex ?? 0, isRest: false });
     }
 
     // Add rests for cursor tracking
@@ -401,7 +401,7 @@ export class AudioPlaybackService {
     for (const r of rests) {
       const rbo = Math.round(r.beatOffset * 1000) / 1000;
       if (!beatMap.has(rbo)) {
-        timingMap.push({ time: r.beatOffset * secondsPerBeat, x: r.x || 0, y: r.y || 0, staffIndex: r.staffIndex, isRest: true });
+        timingMap.push({ time: r.beatOffset * secondsPerBeat, x: r.x || 0, y: r.y || 0, staffIndex: r.staffIndex, systemIndex: r.systemIndex ?? 0, isRest: true });
       }
     }
     timingMap.sort((a, b) => a.time - b.time);
@@ -598,7 +598,7 @@ export class AudioPlaybackService {
         const avgY = col.reduce((s, n) => s + (n.y || 0), 0) / col.length;
         const si = col[0].staffIndex;
 
-        timingMap.push({ time: globalTime, x: avgX, y: avgY, staffIndex: si, isRest: isAllRests });
+        timingMap.push({ time: globalTime, x: avgX, y: avgY, staffIndex: si, systemIndex: col[0].systemIndex ?? 0, isRest: isAllRests });
 
         if (!isAllRests) {
           const noteEntries = realNotes.map(n => ({

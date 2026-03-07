@@ -12,8 +12,8 @@ import AsyncStorage from '@react-native-async-storage/async-storage';
 import * as Crypto from 'expo-crypto';
 import { File } from 'expo-file-system/next';
 
-const CACHE_PREFIX = 'omr_cache_v2_';
-const INDEX_KEY = 'omr_cache_index_v2';
+const CACHE_PREFIX = 'omr_cache_v3_';
+const INDEX_KEY = 'omr_cache_index_v3';
 const MAX_AGE_MS = 7 * 24 * 60 * 60 * 1000; // 7 days
 const MAX_ENTRIES = 20; // keep at most 20 cached results
 

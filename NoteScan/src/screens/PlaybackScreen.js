@@ -338,11 +338,6 @@ export const PlaybackScreen = ({ imageUri, onNavigateBack }) => {
       }
     }
 
-    const staffToSystem = new Map();
-    systemBounds.forEach((sys, idx) => {
-      for (const sti of sys.staffIndices) staffToSystem.set(sti, idx);
-    });
-
     const xValues = timingMap.map((e) => e.x);
     const minX = Math.min(...xValues);
     const maxX = Math.max(...xValues);
@@ -350,7 +345,8 @@ export const PlaybackScreen = ({ imageUri, onNavigateBack }) => {
 
     const positions = timingMap.map((entry) => {
       const ratio = (entry.x - minX) / rangeX;
-      const sysIdx = staffToSystem.get(entry.staffIndex) ?? 0;
+      // Use systemIndex directly from the timing map (set by AudiverisService)
+      const sysIdx = entry.systemIndex ?? 0;
       return { time: entry.time, ratio: Math.max(0, Math.min(1, ratio)), systemIndex: sysIdx, y: entry.y };
     });
 
