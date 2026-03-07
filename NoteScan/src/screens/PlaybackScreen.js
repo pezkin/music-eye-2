@@ -205,7 +205,7 @@ export const PlaybackScreen = ({ imageUri, onNavigateBack }) => {
     if (refTempo !== tempo) {
       tempoRenderTimerRef.current = setTimeout(() => {
         reRenderAtTempo(tempo);
-      }, 400);
+      }, 600);
     }
 
     return () => {
@@ -263,8 +263,8 @@ export const PlaybackScreen = ({ imageUri, onNavigateBack }) => {
         await AudioPlaybackService.mixVoiceTracks(voiceSelection);
       if (myId !== prepareIdRef.current) return;
 
-      const wasPlaying = isPlaying;
-      const wasPaused = isPaused;
+      // Read playback state directly from service (not stale React closure)
+      const wasPlaying = AudioPlaybackService.isPlaying;
 
       // Stop current sound so next play uses the new file
       if (AudioPlaybackService.sound) {
@@ -280,8 +280,8 @@ export const PlaybackScreen = ({ imageUri, onNavigateBack }) => {
       setTotalDuration(dur);
       buildCursorInfo(timingMap);
 
-      // If was playing, auto-restart at rate=1.0
-      if (wasPlaying && !wasPaused) {
+      // If was playing, auto-restart at rate=1.0 (now with correct tempo audio)
+      if (wasPlaying) {
         setIsPlaying(true);
         setIsPaused(false);
         setPlaybackTime(0);
@@ -291,9 +291,6 @@ export const PlaybackScreen = ({ imageUri, onNavigateBack }) => {
           () => { setIsPlaying(false); setIsPaused(false); setPlaybackTime(dur); },
           1.0
         );
-      } else {
-        setIsPlaying(false);
-        setIsPaused(false);
       }
 
       console.log(`✅ Tempo re-render: ${newTempo} BPM (rate → 1.0)`);
@@ -652,11 +649,7 @@ export const PlaybackScreen = ({ imageUri, onNavigateBack }) => {
             maximumValue={240}
             step={1}
             value={tempo}
-            onValueChange={(v) => {
-              const rate = Math.round(v) / referenceTempoRef.current;
-              AudioPlaybackService.setPlaybackRate(rate);
-            }}
-            onSlidingComplete={(v) => setTempo(Math.round(v))}
+            onValueChange={(v) => setTempo(Math.round(v))}
             minimumTrackTintColor={barPalette.accent}
             maximumTrackTintColor={barPalette.barBorder}
             thumbTintColor={barPalette.accent}
