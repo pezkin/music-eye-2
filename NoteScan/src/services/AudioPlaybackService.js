@@ -5,9 +5,9 @@ import { SoundFontService } from './SoundFontService';
 
 /**
  * Piano audio synthesis and playback engine.
- * Uses react-native-audio-api (Web Audio API) for instant playback.
- * Notes are scheduled as individual AudioBufferSourceNodes —
- * tempo changes just reschedule events, no re-synthesis needed.
+ * Uses react-native-audio-api AudioBufferQueueSourceNode for streaming playback.
+ * A single queue node is fed small mixed chunks — tempo changes just clear the
+ * queue and re-feed from the current beat position. No per-note nodes.
  * Falls back to expo-av WAV-file path only when Web Audio is unavailable.
  */
 export class AudioPlaybackService {
@@ -18,10 +18,9 @@ export class AudioPlaybackService {
   static _renderTempo = 120;
   static _noteWaveformCache = new Map();
 
-  /* ─── Web Audio API engine ─── */
+  /* ─── Web Audio queue-streaming engine ─── */
   static _audioCtx = null;
-  static _scheduledSources = [];   // active AudioBufferSourceNode[]
-  static _audioBufferCache = new Map(); // cacheKey → AudioBuffer
+  static _audioBufferCache = new Map(); // kept for selectPreset clearing
   static _noteEvents = null;       // [{ midiNote, velocity, beatOffset, durationBeats, voice }]
   static _timingBeatData = null;   // [{ beatOffset, x, y, staffIndex, systemIndex, isRest }]
   static _totalBeats = 0;
@@ -31,6 +30,15 @@ export class AudioPlaybackService {
   static _onPositionUpdate = null;
   static _onFinished = null;
   static _currentTempo = 120;
+
+  /* ─── Queue streaming state ─── */
+  static _queueNode = null;        // single AudioBufferQueueSourceNode
+  static _voiceSelection = null;   // current voice selection for mixing
+  static _mixCursor = 0;           // next sample position to mix/enqueue
+  static _feedTimer = null;        // setInterval for chunk feeding
+  static _CHUNK_SIZE = 4096;       // samples per chunk (~93ms at 44100)
+  static _LOOKAHEAD_SEC = 0.5;     // seconds of audio to buffer ahead
+  static _FEED_MS = 30;            // ms between feed timer ticks
 
   /* ─── SoundFont loading ─── */
 
@@ -202,14 +210,12 @@ export class AudioPlaybackService {
   }
 
   /**
-   * Pre-generate AudioBuffers for all unique (midiNote, velocity) combos.
+   * Pre-generate Float32Array waveforms for all unique (midiNote, velocity) combos.
    * Renders each at the longest needed duration (slowest tempo = 40 BPM)
-   * so the same buffer works at any tempo — schedulePlayback just truncates
-   * via source.stop().
+   * so the chunk mixer can read from them at any tempo.
    */
-  static _precacheAudioBuffers() {
+  static _precacheWaveforms() {
     if (!this._noteEvents || this._noteEvents.length === 0) return;
-    const ctx = this._getAudioContext();
     const spbSlow = 60 / 40; // seconds-per-beat at 40 BPM (slider minimum)
 
     // Find max durationBeats for each unique (midiNote, velocity)
@@ -220,18 +226,15 @@ export class AudioPlaybackService {
       if (evt.durationBeats > cur) noteMaxBeats.set(key, evt.durationBeats);
     }
 
-    // Generate AudioBuffer for each unique note at max possible duration
+    // Generate waveform for each unique note at max possible duration
+    // generatePianoNote populates _noteWaveformCache automatically
     for (const [key, maxBeats] of noteMaxBeats) {
-      if (this._audioBufferCache.has(key)) continue;
       const [midi, vel] = key.split('_').map(Number);
       const maxSec = maxBeats * spbSlow;
-      const samples = this.generatePianoNote(midi, maxSec, vel);
-      const buf = ctx.createBuffer(1, samples.length, 44100);
-      buf.getChannelData(0).set(samples);
-      this._audioBufferCache.set(key, buf);
+      this.generatePianoNote(midi, maxSec, vel);
     }
 
-    console.log(`🎹 Pre-cached ${noteMaxBeats.size} AudioBuffers for ${this._noteEvents.length} events`);
+    console.log(`🎹 Pre-cached ${noteMaxBeats.size} waveforms for ${this._noteEvents.length} events`);
   }
 
   /**
@@ -314,8 +317,8 @@ export class AudioPlaybackService {
     this._timingBeatData = timingBeatData;
     this._totalBeats = totalBeats;
 
-    // Pre-generate all AudioBuffers so play/tempo-change is instant
-    this._precacheAudioBuffers();
+    // Pre-generate all waveforms so play/tempo-change is instant
+    this._precacheWaveforms();
 
     console.log(`🎵 Prepared ${noteEvents.length} note events, ${totalBeats.toFixed(1)} total beats`);
     return { noteEvents, timingBeatData, totalBeats };
@@ -338,73 +341,111 @@ export class AudioPlaybackService {
   }
 
   /**
-   * Schedule all note events via Web Audio API for given tempo + voice selection.
-   * This is near-instant: just creates AudioBufferSourceNodes with start times.
+   * Mix one chunk of audio: find active notes overlapping the sample range,
+   * read from _noteWaveformCache Float32Arrays, and sum into output.
    */
-  static schedulePlayback(tempo, voiceSelection, startOffsetSec = 0) {
-    this._stopScheduled();
+  static _mixChunk(startSample, chunkSize) {
+    const sampleRate = 44100;
+    const spb = 60 / this._currentTempo;
+    const chunk = new Float32Array(chunkSize);
 
-    const ctx = this._getAudioContext();
-    if (ctx.state === 'suspended') ctx.resume();
-
-    const spb = 60 / tempo;
-    const totalDuration = this._totalBeats * spb;
-    const now = ctx.currentTime + 0.05; // tiny lookahead for scheduling precision
-    const sources = [];
+    const t0 = startSample / sampleRate;
+    const t1 = (startSample + chunkSize) / sampleRate;
 
     for (const evt of this._noteEvents) {
-      if (!voiceSelection[evt.voice]) continue;
+      if (this._voiceSelection && !this._voiceSelection[evt.voice]) continue;
 
-      const noteTime = evt.beatOffset * spb;
-      if (noteTime < startOffsetSec) continue; // skip past notes when seeking
+      const noteStart = evt.beatOffset * spb;
+      const noteDur = evt.durationBeats * spb;
+      const noteEnd = noteStart + noteDur;
 
-      const durSec = evt.durationBeats * spb;
-      const startAt = now + noteTime - startOffsetSec;
-      const stopAt = startAt + durSec;
+      if (noteEnd <= t0 || noteStart >= t1) continue;
 
-      // Lookup pre-cached buffer (duration-independent, keyed by midiNote_velocity)
       const cacheKey = `${evt.midiNote}_${evt.velocity}`;
-      const audioBuf = this._audioBufferCache.get(cacheKey);
-      if (!audioBuf) continue;
+      const waveform = this._noteWaveformCache.get(cacheKey);
+      if (!waveform) continue;
 
-      // GainNode per note: 5ms anti-click fade at truncation point
-      const gain = ctx.createGain();
-      gain.connect(ctx.destination);
-      if (durSec > 0.01) {
-        gain.gain.setValueAtTime(1, startAt);
-        gain.gain.setValueAtTime(1, Math.max(startAt, stopAt - 0.005));
-        gain.gain.linearRampToValueAtTime(0, stopAt);
+      const noteStartSample = Math.round(noteStart * sampleRate);
+      const chunkStart = Math.max(0, noteStartSample - startSample);
+      const waveOffset = Math.max(0, startSample - noteStartSample);
+      const waveEnd = Math.min(waveform.length, Math.round(noteDur * sampleRate));
+
+      for (let i = chunkStart; i < chunkSize; i++) {
+        const wi = waveOffset + (i - chunkStart);
+        if (wi >= waveEnd || wi >= waveform.length) break;
+        chunk[i] += waveform[wi];
       }
-
-      const source = ctx.createBufferSource();
-      source.buffer = audioBuf;
-      source.connect(gain);
-      source.start(startAt);
-      source.stop(stopAt + 0.01); // slightly past fade to let it complete
-      sources.push(source);
     }
 
-    this._scheduledSources = sources;
-    this._playStartTime = now;
-    this._playStartOffset = startOffsetSec;
-    this._currentTempo = tempo;
-    this.isPlaying = true;
-    this._renderTempo = tempo;
+    // Soft-clip to prevent harsh distortion
+    let peak = 0;
+    for (let i = 0; i < chunkSize; i++) {
+      const a = Math.abs(chunk[i]);
+      if (a > peak) peak = a;
+    }
+    if (peak > 1) {
+      const inv = 1 / peak;
+      for (let i = 0; i < chunkSize; i++) chunk[i] *= inv;
+    }
 
-    // Position tracking timer (~60 fps)
-    this._startPositionTracking(totalDuration - startOffsetSec);
-
-    console.log(`▶️ Scheduled ${sources.length} notes at ${tempo} BPM via Web Audio`);
-    return { totalDuration };
+    return chunk;
   }
 
-  /** Stop all scheduled Web Audio sources. */
-  static _stopScheduled() {
-    for (const src of this._scheduledSources) {
-      try { src.stop(); } catch (_) {}
+  /**
+   * Enqueue mixed chunks to keep the AudioBufferQueueSourceNode fed.
+   * Maintains _LOOKAHEAD_SEC of audio queued ahead of current playback position.
+   */
+  static _feedChunks() {
+    if (!this._queueNode || !this._noteEvents) return;
+
+    const sampleRate = 44100;
+    const spb = 60 / this._currentTempo;
+    const totalSamples = Math.ceil(this._totalBeats * spb * sampleRate);
+    const ctx = this._getAudioContext();
+
+    const elapsed = ctx.currentTime - this._playStartTime + this._playStartOffset;
+    const currentSample = Math.max(0, Math.floor(elapsed * sampleRate));
+    const lookaheadSamples = Math.floor(this._LOOKAHEAD_SEC * sampleRate);
+    const targetSample = Math.min(currentSample + lookaheadSamples, totalSamples);
+
+    while (this._mixCursor < targetSample) {
+      const remaining = totalSamples - this._mixCursor;
+      const size = Math.min(this._CHUNK_SIZE, remaining);
+      const chunk = this._mixChunk(this._mixCursor, size);
+
+      const buf = ctx.createBuffer(1, size, sampleRate);
+      buf.getChannelData(0).set(chunk);
+      this._queueNode.enqueueBuffer(buf);
+      this._mixCursor += size;
     }
-    this._scheduledSources = [];
+
+    if (this._mixCursor >= totalSamples) {
+      this._stopFeedTimer();
+    }
+  }
+
+  /** Start the feed timer that keeps chunks flowing. */
+  static _startFeedTimer() {
+    this._stopFeedTimer();
+    this._feedTimer = setInterval(() => this._feedChunks(), this._FEED_MS);
+  }
+
+  /** Stop the feed timer. */
+  static _stopFeedTimer() {
+    if (this._feedTimer) {
+      clearInterval(this._feedTimer);
+      this._feedTimer = null;
+    }
+  }
+
+  /** Stop queue playback completely (node + timers). */
+  static _stopQueue() {
+    this._stopFeedTimer();
     this._stopPositionTracking();
+    if (this._queueNode) {
+      try { this._queueNode.stop(); } catch (_) {}
+      this._queueNode = null;
+    }
   }
 
   /** Start a 60fps position tracking timer. */
@@ -425,7 +466,7 @@ export class AudioPlaybackService {
       if (elapsed >= this._totalBeats * (60 / this._currentTempo)) {
         this.isPlaying = false;
         this._stopPositionTracking();
-        this._stopScheduled();
+        this._stopQueue();
         if (this._onFinished) this._onFinished();
       }
     }, 16);
@@ -449,11 +490,22 @@ export class AudioPlaybackService {
     const timingMap = this.buildTimingMap(newTempo);
     const totalDuration = this._totalBeats * (60 / newTempo);
 
-    if (this.isPlaying) {
-      // Calculate current position, reschedule from there
+    if (this.isPlaying && this._queueNode) {
       const ctx = this._getAudioContext();
       const elapsed = ctx.currentTime - this._playStartTime + this._playStartOffset;
-      this.schedulePlayback(newTempo, voiceSelection, elapsed);
+      const currentBeat = elapsed * this._currentTempo / 60;
+
+      // Clear queued audio and re-feed from current beat with new tempo
+      this._queueNode.clearBuffers();
+
+      const newElapsed = currentBeat * 60 / newTempo;
+      this._currentTempo = newTempo;
+      this._mixCursor = Math.floor(newElapsed * 44100);
+      this._playStartTime = ctx.currentTime;
+      this._playStartOffset = newElapsed;
+      this._voiceSelection = voiceSelection;
+
+      this._feedChunks();
     }
 
     this._currentTempo = newTempo;
@@ -1023,9 +1075,35 @@ export class AudioPlaybackService {
    * Called when note events are prepared.
    */
   static playWebAudio(tempo, voiceSelection, onPositionUpdate, onFinished) {
+    this._stopQueue();
+
+    const ctx = this._getAudioContext();
+    if (ctx.state === 'suspended') ctx.resume();
+
     this._onPositionUpdate = onPositionUpdate;
     this._onFinished = onFinished;
-    this.schedulePlayback(tempo, voiceSelection, 0);
+    this._currentTempo = tempo;
+    this._renderTempo = tempo;
+    this._voiceSelection = voiceSelection;
+    this._mixCursor = 0;
+
+    // Create single queue node
+    this._queueNode = ctx.createBufferQueueSource();
+    this._queueNode.connect(ctx.destination);
+
+    this._playStartTime = ctx.currentTime;
+    this._playStartOffset = 0;
+
+    // Feed initial chunks then start
+    this._feedChunks();
+    this._queueNode.start(0);
+    this.isPlaying = true;
+    this._useWebAudio = true;
+
+    this._startFeedTimer();
+    this._startPositionTracking(this._totalBeats * (60 / tempo));
+
+    console.log(`▶️ Queue playback started at ${tempo} BPM`);
     return { totalDuration: this._totalBeats * (60 / tempo) };
   }
 
@@ -1086,10 +1164,15 @@ export class AudioPlaybackService {
 
   static async pause() {
     if (this._useWebAudio) {
-      this._stopScheduled();
+      this._stopFeedTimer();
+      this._stopPositionTracking();
       // Remember position for resume
       if (this._audioCtx) {
         this._playStartOffset = this._audioCtx.currentTime - this._playStartTime + this._playStartOffset;
+      }
+      if (this._queueNode) {
+        try { this._queueNode.stop(); } catch (_) {}
+        this._queueNode = null;
       }
       this.isPlaying = false;
       return;
@@ -1106,7 +1189,22 @@ export class AudioPlaybackService {
   static async resume(voiceSelection) {
     if (this._useWebAudio) {
       if (this._noteEvents && voiceSelection) {
-        this.schedulePlayback(this._currentTempo, voiceSelection, this._playStartOffset);
+        const ctx = this._getAudioContext();
+        if (ctx.state === 'suspended') ctx.resume();
+
+        this._voiceSelection = voiceSelection;
+        this._mixCursor = Math.floor(this._playStartOffset * 44100);
+
+        this._queueNode = ctx.createBufferQueueSource();
+        this._queueNode.connect(ctx.destination);
+        this._playStartTime = ctx.currentTime;
+        this._feedChunks();
+        this._queueNode.start(0);
+        this.isPlaying = true;
+
+        this._startFeedTimer();
+        const remaining = this._totalBeats * (60 / this._currentTempo) - this._playStartOffset;
+        this._startPositionTracking(remaining);
       }
       return;
     }
@@ -1123,7 +1221,7 @@ export class AudioPlaybackService {
 
   static async stop() {
     // Web Audio path
-    this._stopScheduled();
+    this._stopQueue();
     this._playStartOffset = 0;
 
     // expo-av path
@@ -1139,11 +1237,15 @@ export class AudioPlaybackService {
 
   static async seekTo(timeSeconds, voiceSelection) {
     if (this._useWebAudio && voiceSelection) {
-      const wasPlaying = this.isPlaying;
-      this._stopScheduled();
-      this._playStartOffset = timeSeconds;
-      if (wasPlaying) {
-        this.schedulePlayback(this._currentTempo, voiceSelection, timeSeconds);
+      if (this.isPlaying && this._queueNode) {
+        this._queueNode.clearBuffers();
+        this._mixCursor = Math.floor(timeSeconds * 44100);
+        this._playStartTime = this._getAudioContext().currentTime;
+        this._playStartOffset = timeSeconds;
+        this._voiceSelection = voiceSelection;
+        this._feedChunks();
+      } else {
+        this._playStartOffset = timeSeconds;
       }
       return;
     }
