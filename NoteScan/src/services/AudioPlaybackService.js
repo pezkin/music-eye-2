@@ -656,9 +656,8 @@ export class AudioPlaybackService {
   /**
    * Play combined audio. Calls `onPositionUpdate(timeSec)` ~60×/sec.
    * Calls `onFinished()` when playback completes.
-   * @param {number} rate - playback rate (1.0 = normal speed)
    */
-  static async play(fileUri, onPositionUpdate, onFinished, rate = 1.0) {
+  static async play(fileUri, onPositionUpdate, onFinished) {
     await this.stop();
 
     if (!fileUri) {
@@ -668,12 +667,12 @@ export class AudioPlaybackService {
     }
 
     this._tempFileUri = fileUri;
-    console.log(`▶️ play(): loading ${fileUri}, rate=${rate.toFixed(2)}`);
+    console.log(`▶️ play(): loading ${fileUri}`);
 
     try {
       const { sound, status: initialStatus } = await Audio.Sound.createAsync(
         { uri: fileUri },
-        { shouldPlay: true, progressUpdateIntervalMillis: 16, rate, shouldCorrectPitch: true }
+        { shouldPlay: true, progressUpdateIntervalMillis: 16 }
       );
 
       console.log(`▶️ play(): sound created, duration=${initialStatus.durationMillis}ms, isPlaying=${initialStatus.isPlaying}`);
@@ -703,17 +702,6 @@ export class AudioPlaybackService {
       console.error('▶️ play() error:', err);
       this.isPlaying = false;
       if (onFinished) onFinished();
-    }
-  }
-
-  /** Instant tempo change via playback rate — no re-render needed. */
-  static async setPlaybackRate(rate) {
-    if (this.sound) {
-      try {
-        await this.sound.setRateAsync(rate, true);
-      } catch (e) {
-        console.warn('setPlaybackRate error:', e);
-      }
     }
   }
 

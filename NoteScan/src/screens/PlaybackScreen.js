@@ -52,6 +52,7 @@ export const PlaybackScreen = ({ imageUri, onNavigateBack }) => {
   const [isPaused, setIsPaused] = useState(false);
   const [preparing, setPreparing] = useState(false);
   const [tempo, setTempo] = useState(120);
+  const [sliderTempo, setSliderTempo] = useState(120);
   const [showTempoSlider, setShowTempoSlider] = useState(false);
 
   const [playbackTime, setPlaybackTime] = useState(0);
@@ -67,8 +68,7 @@ export const PlaybackScreen = ({ imageUri, onNavigateBack }) => {
 
   const audioFileUriRef = useRef(null);
   const prepareIdRef = useRef(0);
-  const referenceTempoRef = useRef(120);
-  const tempoRenderTimerRef = useRef(null);
+  const renderTempoRef = useRef(120);
 
   const [voiceSelection, setVoiceSelection] = useState({
     Soprano: true,
@@ -139,9 +139,7 @@ export const PlaybackScreen = ({ imageUri, onNavigateBack }) => {
     });
   }, [processScore]);
 
-  /* ── Phase 1: Pre-render voice tracks when scoreData or instrument changes ── */
-  /* Audio is rendered once at a fixed reference tempo (120 BPM).                */
-  /* Tempo changes are handled instantly via playback rate adjustment.           */
+  /* ── Phase 1: Pre-render voice tracks when scoreData, instrument, or tempo changes ── */
   useEffect(() => {
     if (!scoreData) return;
     let cancelled = false;
@@ -150,22 +148,43 @@ export const PlaybackScreen = ({ imageUri, onNavigateBack }) => {
 
     const doPreRender = async () => {
       const myId = ++prepareIdRef.current;
+      const wasPlaying = AudioPlaybackService.isPlaying;
+
+      // Stop current playback before re-rendering
+      if (AudioPlaybackService.sound) {
+        try {
+          await AudioPlaybackService.sound.stopAsync();
+          await AudioPlaybackService.sound.unloadAsync();
+        } catch (_) {}
+        AudioPlaybackService.sound = null;
+      }
+      AudioPlaybackService.isPlaying = false;
+
       setPreparing(true);
       try {
         AudioPlaybackService.selectPreset(selectedPresetIndex);
-        const renderTempo = 120;
-        referenceTempoRef.current = renderTempo;
-        console.log(`🎹 preRender [${myId}]: rendering 4 voice tracks at ${renderTempo} BPM (reference)...`);
+        renderTempoRef.current = tempo;
+        console.log(`🎹 preRender [${myId}]: rendering at ${tempo} BPM...`);
 
-        const result = await AudioPlaybackService.preRenderVoiceTracks(scoreData.notes, renderTempo);
+        const result = await AudioPlaybackService.preRenderVoiceTracks(scoreData.notes, tempo);
 
         if (cancelled || myId !== prepareIdRef.current) return;
 
         if (result) {
-          // Pre-render succeeded — now do initial mix with current voice selection
           await doMix(myId);
+
+          // Auto-restart if was playing
+          if (wasPlaying && myId === prepareIdRef.current && audioFileUriRef.current) {
+            setIsPlaying(true);
+            setIsPaused(false);
+            setPlaybackTime(0);
+            await AudioPlaybackService.play(
+              audioFileUriRef.current,
+              (timeSec) => setPlaybackTime(timeSec),
+              () => { setIsPlaying(false); setIsPaused(false); }
+            );
+          }
         } else {
-          // Fallback: no beatOffset data — use legacy path
           await legacyPrepare(myId);
         }
       } catch (e) {
@@ -181,37 +200,8 @@ export const PlaybackScreen = ({ imageUri, onNavigateBack }) => {
 
     return () => {
       cancelled = true;
-      if (AudioPlaybackService.sound) {
-        try {
-          AudioPlaybackService.sound.stopAsync().catch(() => {});
-          AudioPlaybackService.sound.unloadAsync().catch(() => {});
-        } catch (_) {}
-        AudioPlaybackService.sound = null;
-      }
-      AudioPlaybackService.isPlaying = false;
     };
-  }, [scoreData, selectedPresetIndex]);
-
-  /* ── Tempo change: apply rate immediately, then re-render in background ── */
-  useEffect(() => {
-    const refTempo = referenceTempoRef.current;
-    if (refTempo <= 0) return;
-    // Instant rate-based preview (may have quality loss at extreme ratios)
-    const rate = tempo / refTempo;
-    AudioPlaybackService.setPlaybackRate(rate);
-
-    // Schedule background re-render at the actual tempo for full quality
-    if (tempoRenderTimerRef.current) clearTimeout(tempoRenderTimerRef.current);
-    if (refTempo !== tempo) {
-      tempoRenderTimerRef.current = setTimeout(() => {
-        reRenderAtTempo(tempo);
-      }, 600);
-    }
-
-    return () => {
-      if (tempoRenderTimerRef.current) clearTimeout(tempoRenderTimerRef.current);
-    };
-  }, [tempo]);
+  }, [scoreData, selectedPresetIndex, tempo]);
 
   /* ── Phase 2: Quick mix when voice selection changes (no re-render needed) ── */
   useEffect(() => {
@@ -239,65 +229,6 @@ export const PlaybackScreen = ({ imageUri, onNavigateBack }) => {
 
     return () => { cancelled = true; };
   }, [voiceSelection]);
-
-  /**
-   * Background re-render at the actual tempo for full audio quality.
-   * Called automatically after tempo changes settle (debounced 400ms).
-   */
-  const reRenderAtTempo = async (newTempo) => {
-    if (!scoreData) return;
-    if (referenceTempoRef.current === newTempo) return;
-
-    const myId = ++prepareIdRef.current;
-    try {
-      AudioPlaybackService.selectPreset(selectedPresetIndex);
-      const result = await AudioPlaybackService.preRenderVoiceTracks(
-        scoreData.notes, newTempo
-      );
-      if (myId !== prepareIdRef.current) return;
-      if (!result) return;
-
-      referenceTempoRef.current = newTempo;
-
-      const { fileUri, timingMap, totalDuration: dur } =
-        await AudioPlaybackService.mixVoiceTracks(voiceSelection);
-      if (myId !== prepareIdRef.current) return;
-
-      // Read playback state directly from service (not stale React closure)
-      const wasPlaying = AudioPlaybackService.isPlaying;
-
-      // Stop current sound so next play uses the new file
-      if (AudioPlaybackService.sound) {
-        try {
-          await AudioPlaybackService.sound.stopAsync();
-          await AudioPlaybackService.sound.unloadAsync();
-        } catch (_) {}
-        AudioPlaybackService.sound = null;
-      }
-      AudioPlaybackService.isPlaying = false;
-
-      audioFileUriRef.current = fileUri;
-      setTotalDuration(dur);
-      buildCursorInfo(timingMap);
-
-      // If was playing, auto-restart at rate=1.0 (now with correct tempo audio)
-      if (wasPlaying) {
-        setIsPlaying(true);
-        setIsPaused(false);
-        setPlaybackTime(0);
-        await AudioPlaybackService.play(
-          fileUri,
-          (timeSec) => setPlaybackTime(timeSec),
-          () => { setIsPlaying(false); setIsPaused(false); setPlaybackTime(dur); },
-          1.0
-        );
-      }
-
-      console.log(`✅ Tempo re-render: ${newTempo} BPM (rate → 1.0)`);
-    } catch (e) {
-      console.warn('Tempo re-render error:', e);
-    }
-  };
 
   /** Mix pre-rendered voice buffers into a single WAV based on current voiceSelection */
   const doMix = async (myId) => {
@@ -453,8 +384,6 @@ export const PlaybackScreen = ({ imageUri, onNavigateBack }) => {
     }
 
     if (isPaused) {
-      const rate = tempo / referenceTempoRef.current;
-      await AudioPlaybackService.setPlaybackRate(rate);
       await AudioPlaybackService.resume();
       setIsPlaying(true);
       setIsPaused(false);
@@ -466,8 +395,7 @@ export const PlaybackScreen = ({ imageUri, onNavigateBack }) => {
     setPlaybackTime(0);
 
     const fileUri = audioFileUriRef.current;
-    const rate = tempo / referenceTempoRef.current;
-    console.log(`▶️ handlePlay: playing ${fileUri} at rate=${rate.toFixed(2)}`);
+    console.log(`▶️ handlePlay: playing ${fileUri}`);
 
     try {
       await AudioPlaybackService.play(
@@ -477,8 +405,7 @@ export const PlaybackScreen = ({ imageUri, onNavigateBack }) => {
           setIsPlaying(false);
           setIsPaused(false);
           setPlaybackTime(totalDuration);
-        },
-        rate
+        }
       );
     } catch (e) {
       console.error('Play error:', e);
@@ -641,15 +568,20 @@ export const PlaybackScreen = ({ imageUri, onNavigateBack }) => {
         <View style={styles.tempoDrawer}>
           <View style={styles.tempoDrawerRow}>
             <Text style={styles.tempoDrawerLabel}>Tempo</Text>
-            <Text style={styles.tempoDrawerValue}>♩ = {tempo}</Text>
+            <Text style={styles.tempoDrawerValue}>♩ = {sliderTempo}</Text>
           </View>
           <Slider
             style={styles.tempoSlider}
             minimumValue={40}
             maximumValue={240}
             step={1}
-            value={tempo}
-            onValueChange={(v) => setTempo(Math.round(v))}
+            value={sliderTempo}
+            onValueChange={(v) => setSliderTempo(Math.round(v))}
+            onSlidingComplete={(v) => {
+              const bpm = Math.round(v);
+              setSliderTempo(bpm);
+              setTempo(bpm);
+            }}
             minimumTrackTintColor={barPalette.accent}
             maximumTrackTintColor={barPalette.barBorder}
             thumbTintColor={barPalette.accent}
@@ -669,7 +601,7 @@ export const PlaybackScreen = ({ imageUri, onNavigateBack }) => {
                   styles.tempoPresetBtn,
                   Math.abs(tempo - p.bpm) < 10 && styles.tempoPresetBtnActive,
                 ]}
-                onPress={() => setTempo(p.bpm)}
+                onPress={() => { setSliderTempo(p.bpm); setTempo(p.bpm); }}
               >
                 <Text
                   style={[
