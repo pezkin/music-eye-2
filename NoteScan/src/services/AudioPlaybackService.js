@@ -98,27 +98,38 @@ export class AudioPlaybackService {
     const attackTime = 0.008;
     const decayTime = 0.15;
     const sustainLevel = 0.6;
-    const releaseTime = Math.min(0.2, duration * 0.15);
+    const releaseTime = Math.max(0.015, Math.min(0.2, duration * 0.2));
 
-    const attackSamples = Math.floor(sampleRate * attackTime);
-    const decaySamples = Math.floor(sampleRate * decayTime);
+    // Scale attack+decay to fit within note (leave room for release)
+    const availableForADS = Math.max(0, duration - releaseTime);
+    const rawADTime = attackTime + decayTime;
+    const adsScale = rawADTime > availableForADS && rawADTime > 0
+      ? availableForADS / rawADTime : 1.0;
+    const actualAttackSamples = Math.floor(sampleRate * attackTime * adsScale);
+    const actualDecaySamples = Math.floor(sampleRate * decayTime * adsScale);
+
     const releaseSamples = Math.floor(sampleRate * releaseTime);
-    const sustainSamples = Math.max(0, sampleCount - attackSamples - decaySamples - releaseSamples);
+    const releaseStart = Math.max(0, sampleCount - releaseSamples);
 
     for (let i = 0; i < sampleCount; i++) {
-      let envelope = 0;
-
-      if (i < attackSamples) {
-        envelope = i / attackSamples;
-      } else if (i < attackSamples + decaySamples) {
-        const p = (i - attackSamples) / decaySamples;
-        envelope = 1.0 - p * (1.0 - sustainLevel);
-      } else if (i < attackSamples + decaySamples + sustainSamples) {
-        const p = (i - attackSamples - decaySamples) / Math.max(1, sustainSamples);
-        envelope = sustainLevel * (1.0 - p * 0.3);
+      // ── ADS envelope (attack → decay → sustain) ──
+      let adsEnvelope = 0;
+      if (i < actualAttackSamples) {
+        adsEnvelope = i / Math.max(1, actualAttackSamples);
+      } else if (i < actualAttackSamples + actualDecaySamples) {
+        const p = (i - actualAttackSamples) / Math.max(1, actualDecaySamples);
+        adsEnvelope = 1.0 - p * (1.0 - sustainLevel);
       } else {
-        const p = (i - attackSamples - decaySamples - sustainSamples) / Math.max(1, releaseSamples);
-        envelope = sustainLevel * 0.7 * (1.0 - p);
+        // Gentle sustain decay (natural piano-like fade)
+        const sustainTime = i - actualAttackSamples - actualDecaySamples;
+        const sustainTotal = Math.max(1, releaseStart - actualAttackSamples - actualDecaySamples);
+        adsEnvelope = sustainLevel * (1.0 - (sustainTime / sustainTotal) * 0.3);
+      }
+
+      // ── Release fade: ALWAYS applied at end of note (prevents clicks) ──
+      let releaseMul = 1.0;
+      if (i >= releaseStart) {
+        releaseMul = 1.0 - (i - releaseStart) / Math.max(1, releaseSamples);
       }
 
       const t = i / sampleRate;
@@ -128,7 +139,7 @@ export class AudioPlaybackService {
       const h4 = 0.06 * Math.sin(2 * Math.PI * frequency * 4 * t);
 
       const sample = (fundamental + h2 + h3 + h4) / 1.56;
-      audioData[i] = sample * envelope * velocityFactor * 0.75;
+      audioData[i] = sample * adsEnvelope * releaseMul * velocityFactor * 0.75;
     }
     return audioData;
   }
@@ -438,6 +449,20 @@ export class AudioPlaybackService {
         const start = offsetSamples;
         const len = Math.min(noteAudio.length, totalSamples - start);
         for (let i = 0; i < len; i++) buf[start + i] += noteAudio[i];
+      }
+    }
+
+    // Normalize each voice buffer independently (prevents loud voices from
+    // dominating the mix and ensures consistent quality across tempos)
+    for (const v of voices) {
+      const buf = buffers[v];
+      let peak = 0;
+      for (let i = 0; i < buf.length; i++) {
+        if (!Number.isFinite(buf[i])) buf[i] = 0;
+        peak = Math.max(peak, Math.abs(buf[i]));
+      }
+      if (peak > 1) {
+        for (let i = 0; i < buf.length; i++) buf[i] /= peak;
       }
     }
 

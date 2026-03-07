@@ -187,14 +187,20 @@ class SoundFontServiceClass {
     const velocityFactor = velocity / 127;
 
     // ADSR envelope from SF2 zone (with sensible minimums to prevent clicks)
-    const attackTime = Math.max(0.005, Math.min(zone.volAttack || 0.005, 2.0));
+    const attackTime = Math.max(0.003, Math.min(zone.volAttack || 0.005, 2.0));
     const decayTime = Math.max(0.01, Math.min(zone.volDecay || 0.1, 4.0));
     const sustainLevel = Number.isFinite(zone.volSustain) ? zone.volSustain : 0.8;
-    // Minimum 20ms release to prevent end-of-note click/pop
-    const releaseTime = Math.max(0.02, Math.min(zone.volRelease || 0.15, duration * 0.3, 2.0));
+    // Release fade — always applied at end of note to prevent clicks
+    const releaseTime = Math.max(0.015, Math.min(zone.volRelease || 0.15, duration * 0.35, 2.0));
 
-    const attackSamples = Math.floor(outputRate * attackTime);
-    const decaySamples = Math.floor(outputRate * decayTime);
+    // Scale attack+decay to fit within available space (leave room for release)
+    const availableForADS = Math.max(0, duration - releaseTime);
+    const rawADTime = attackTime + decayTime;
+    const adsScale = rawADTime > availableForADS && rawADTime > 0
+      ? availableForADS / rawADTime : 1.0;
+    const actualAttackSamples = Math.floor(outputRate * attackTime * adsScale);
+    const actualDecaySamples = Math.floor(outputRate * decayTime * adsScale);
+
     const releaseSamples = Math.floor(outputRate * releaseTime);
     const releaseStart = Math.max(0, sampleCount - releaseSamples);
 
@@ -223,21 +229,24 @@ class SoundFontServiceClass {
       const s1 = this._getSample16(nextPos);
       const sampleValue = (s0 + (s1 - s0) * frac) / 32768; // Normalize to -1..1
 
-      // ── Envelope ──
-      let envelope = 1.0;
-      if (i < attackSamples) {
-        envelope = i / Math.max(1, attackSamples);
-      } else if (i < attackSamples + decaySamples) {
-        const p = (i - attackSamples) / Math.max(1, decaySamples);
-        envelope = 1.0 - p * (1.0 - sustainLevel);
-      } else if (i >= releaseStart) {
-        const p = (i - releaseStart) / Math.max(1, releaseSamples);
-        envelope = sustainLevel * (1.0 - p);
+      // ── Envelope: ADS shape (attack → decay → sustain) ──
+      let adsEnvelope = 1.0;
+      if (i < actualAttackSamples) {
+        adsEnvelope = i / Math.max(1, actualAttackSamples);
+      } else if (i < actualAttackSamples + actualDecaySamples) {
+        const p = (i - actualAttackSamples) / Math.max(1, actualDecaySamples);
+        adsEnvelope = 1.0 - p * (1.0 - sustainLevel);
       } else {
-        envelope = sustainLevel;
+        adsEnvelope = sustainLevel;
       }
 
-      const val = sampleValue * envelope * velocityFactor * 0.85;
+      // ── Release fade: ALWAYS applied at end of note (prevents clicks) ──
+      let releaseMul = 1.0;
+      if (i >= releaseStart) {
+        releaseMul = 1.0 - (i - releaseStart) / Math.max(1, releaseSamples);
+      }
+
+      const val = sampleValue * adsEnvelope * releaseMul * velocityFactor * 0.85;
       output[i] = Number.isFinite(val) ? val : 0;
       samplePos += pitchRatio;
     }
